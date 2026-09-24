@@ -1,7 +1,7 @@
 //! vectrize: búsqueda semántica local sobre una carpeta de docs.
 //!
 //! Trocear por encabezados → embeddings estáticos (model2vec) en sqlite-vec + BM25 (FTS5),
-//! fusionados con RRF.
+//! fusionados con RRF. Opcional: reordenar los primeros con un cross-encoder (`--rerank`).
 //! Cada `index` reconstruye el índice entero (el incremental llega en la fase 3).
 
 use std::collections::HashMap;
@@ -9,6 +9,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand, ValueEnum};
+use fastembed::{RerankInitOptionsUserDefined, TextRerank, TokenizerFiles, UserDefinedRerankingModel};
 use model2vec_rs::model::StaticModel;
 use rusqlite::{params, Connection};
 
@@ -17,6 +18,13 @@ const MODEL: &str = "minishlab/potion-multilingual-128M";
 /// Extensiones que se leen como texto plano. PDF/HTML llegan en la fase 5.
 const TEXT_EXTS: &[&str] = &["md", "mmd", "puml"];
 const SKIP_DIRS: &[&str] = &[".git", ".obsidian"];
+/// Cross-encoder multilingüe, Apache-2.0. La variante int8 aprovecha AVX-512 VNNI.
+const RERANKER: &str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1";
+const RERANKER_ONNX: &str = "onnx/model_qint8_avx512_vnni.onnx";
+/// Con 10 se pierden aciertos que BM25 deja entre el 11 y el 20.
+const RERANK_CANDIDATES: usize = 20;
+/// Tokens máximos por par (pregunta, trozo).
+const RERANK_MAX_LENGTH: usize = 256;
 
 #[derive(Parser)]
 #[command(about = "Búsqueda semántica local sobre una carpeta de docs")]
@@ -39,6 +47,9 @@ enum Cmd {
         k: usize,
         #[arg(long, value_enum, default_value_t = Mode::Hybrid)]
         mode: Mode,
+        /// Reordena los primeros resultados con un cross-encoder (más lento, más preciso).
+        #[arg(long)]
+        rerank: bool,
     },
 }
 
@@ -76,12 +87,27 @@ fn main() -> Result<()> {
     }
     match cli.cmd {
         Cmd::Index { dir } => index(&cli.db, &dir),
-        Cmd::Search { query, k, mode } => search(&cli.db, &query, k, mode),
+        Cmd::Search { query, k, mode, rerank } => search(&cli.db, &query, k, mode, rerank),
     }
 }
 
 fn load_model() -> Result<StaticModel> {
     StaticModel::from_pretrained(MODEL, None, None, None).context("cargando el modelo")
+}
+
+fn load_reranker() -> Result<TextRerank> {
+    // Mismo caché que el modelo de embeddings (~/.cache/huggingface).
+    let repo = hf_hub::api::sync::Api::new()?.model(RERANKER.into());
+    let read = |f: &str| -> Result<Vec<u8>> { Ok(std::fs::read(repo.get(f)?)?) };
+    let tokenizer = TokenizerFiles {
+        tokenizer_file: read("tokenizer.json")?,
+        config_file: read("config.json")?,
+        special_tokens_map_file: read("special_tokens_map.json")?,
+        tokenizer_config_file: read("tokenizer_config.json")?,
+    };
+    let model = UserDefinedRerankingModel::new(repo.get(RERANKER_ONNX)?, tokenizer);
+    let opts = RerankInitOptionsUserDefined::new().with_max_length(RERANK_MAX_LENGTH);
+    TextRerank::try_new_from_user_defined(model, opts).context("cargando el reranker")
 }
 
 fn index(db: &Path, dir: &Path) -> Result<()> {
@@ -150,7 +176,7 @@ fn index(db: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn search(db: &Path, query: &str, k: usize, mode: Mode) -> Result<()> {
+fn search(db: &Path, query: &str, k: usize, mode: Mode, rerank: bool) -> Result<()> {
     let conn = Connection::open(db).with_context(|| format!("sin índice en {}", db.display()))?;
     let ids = |sql: &str, arg: &dyn rusqlite::ToSql| -> Result<Vec<i64>> {
         let mut stmt = conn.prepare(sql)?;
@@ -170,9 +196,21 @@ fn search(db: &Path, query: &str, k: usize, mode: Mode) -> Result<()> {
         }
     }
     let mut stmt = conn.prepare("SELECT path, heading, text FROM chunks WHERE id = ?1")?;
-    for (i, (id, score)) in rrf(&lists).into_iter().take(k).enumerate() {
-        let (path, heading, text): (String, String, String) =
-            stmt.query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+    let mut chunk = |id: i64| -> Result<(String, String, String)> {
+        Ok(stmt.query_row([id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?)
+    };
+    let mut hits = rrf(&lists);
+    if rerank {
+        hits.truncate(RERANK_CANDIDATES);
+        let docs = hits
+            .iter()
+            .map(|&(id, _)| chunk(id).map(|(_, heading, text)| format!("{heading}\n{text}")))
+            .collect::<Result<Vec<_>>>()?;
+        let ranked = load_reranker()?.rerank(query, docs.iter().map(String::as_str).collect::<Vec<_>>(), false, None)?;
+        hits = ranked.into_iter().map(|r| (hits[r.index].0, r.score as f64)).collect();
+    }
+    for (i, (id, score)) in hits.into_iter().take(k).enumerate() {
+        let (path, heading, text) = chunk(id)?;
         println!("{}. {path}  ({score:.4})\n   {heading}\n   {}\n", i + 1, snippet(&text, 160));
     }
     Ok(())
