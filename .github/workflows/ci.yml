@@ -1,0 +1,29 @@
+name: ci
+on:
+  push:
+    branches: [master] # what lands on master
+  pull_request: # every PR, against any branch
+concurrency: { group: "ci-${{ github.ref }}", cancel-in-progress: true }
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: "clippy, rustfmt" }
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4 # the embedding model (559 MB): downloaded once
+        with: { path: ~/.cache/huggingface, key: hf-bge-m3-int8 }
+      - name: Lint (Linux only, to keep the macOS job short)
+        if: runner.os == 'Linux'
+        run: cargo fmt --check && cargo clippy --all-targets -- -D warnings
+      - run: cargo test -- --include-ignored # includes the end-to-end smoke test (tests/smoke.rs)
