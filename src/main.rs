@@ -2,7 +2,7 @@
 //!
 //! Trocear por encabezados → embeddings (bge-m3 int8) en sqlite-vec + BM25 (FTS5),
 //! fusionados con RRF. Opcional: reordenar los primeros con un cross-encoder (`--rerank`).
-//! Cada `index` reconstruye el índice entero (el incremental llega en la fase 3).
+//! `index` es incremental: solo re-embebe los archivos cuyo hash (blake3) cambió y borra los que ya no están.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -19,6 +19,7 @@ use rusqlite::{params, Connection};
 /// Frente a potion (estático) resuelve las consultas parafraseadas.
 const EMBEDDER: &str = "onnx-community/bge-m3-ONNX";
 const EMBEDDER_ONNX: &str = "onnx/model_int8.onnx";
+const EMBEDDER_DIM: usize = 1024;
 /// Extensiones que se leen como texto plano. PDF/HTML llegan en la fase 5.
 const TEXT_EXTS: &[&str] = &["md", "mmd", "puml"];
 const SKIP_DIRS: &[&str] = &[".git", ".obsidian"];
@@ -44,7 +45,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
-    /// (Re)construye el índice de una carpeta.
+    /// Indexa una carpeta (solo lo que cambió desde la última vez).
     Index { dir: PathBuf },
     /// Busca en el índice.
     Search {
@@ -125,8 +126,35 @@ fn load_reranker() -> Result<TextRerank> {
 fn index(db: &Path, dir: &Path) -> Result<()> {
     let root = dir.canonicalize().with_context(|| format!("no existe {}", dir.display()))?;
     let t = std::time::Instant::now();
+    if let Some(parent) = db.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut conn = Connection::open(db)?;
 
-    let mut chunks = Vec::new();
+    // Otra carpeta, otro modelo o un índice de antes de la fase 3: lo guardado no sirve, se empieza de cero.
+    let root_s = root.to_string_lossy().into_owned();
+    let model = format!("{EMBEDDER}/{EMBEDDER_ONNX}");
+    let stored = conn.query_row("SELECT root, model FROM meta", [], |r| Ok((r.get(0)?, r.get(1)?))).ok();
+    if stored != Some((root_s.clone(), model.clone())) {
+        conn.execute_batch(&format!(
+            "DROP TABLE IF EXISTS chunks; DROP TABLE IF EXISTS vec; DROP TABLE IF EXISTS meta;
+             DROP TABLE IF EXISTS fts; DROP TABLE IF EXISTS files;
+             CREATE TABLE meta (root TEXT NOT NULL, model TEXT NOT NULL);
+             CREATE TABLE files (path TEXT PRIMARY KEY, hash TEXT NOT NULL);
+             CREATE TABLE chunks (id INTEGER PRIMARY KEY, path TEXT, heading TEXT, text TEXT);
+             CREATE INDEX chunks_path ON chunks (path);
+             CREATE VIRTUAL TABLE vec USING vec0(embedding float[{EMBEDDER_DIM}] distance_metric=cosine);
+             CREATE VIRTUAL TABLE fts USING fts5(heading, text, tokenize='unicode61 remove_diacritics 2');"
+        ))?;
+        conn.execute("INSERT INTO meta VALUES (?1, ?2)", [&root_s, &model])?;
+    }
+
+    // Lo que siga en `known` al acabar de recorrer la carpeta es lo que se borró del disco.
+    let mut known: HashMap<String, String> = conn
+        .prepare("SELECT path, hash FROM files")?
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut changed = Vec::new(); // (ruta, hash, contenido) de lo nuevo o modificado
     let mut n_files = 0;
     let walker = walkdir::WalkDir::new(&root)
         .into_iter()
@@ -140,49 +168,57 @@ fn index(db: &Path, dir: &Path) -> Result<()> {
         }
         let content = std::fs::read_to_string(path).with_context(|| format!("leyendo {}", path.display()))?;
         let rel = path.strip_prefix(&root)?.to_string_lossy().into_owned();
-        chunks.extend(chunk_markdown(&rel, &content));
+        let hash = blake3::hash(content.as_bytes()).to_hex().to_string();
         n_files += 1;
+        if known.remove(&rel).as_ref() != Some(&hash) {
+            changed.push((rel, hash, content));
+        }
     }
+    let chunks: Vec<Chunk> = changed.iter().flat_map(|(rel, _, content)| chunk_markdown(rel, content)).collect();
     let t_read = t.elapsed();
 
-    let mut embedder = load_embedder()?;
-    let t_model = t.elapsed();
-    // Se embebe "ruta > encabezados + texto": el contexto del trozo cuenta para la búsqueda.
-    let inputs: Vec<String> = chunks.iter().map(|c| format!("{}\n{}", c.heading, c.text)).collect();
-    let embeddings = embedder.embed(inputs, None)?;
-    let dim = embeddings.first().map_or(0, Vec::len);
+    // Sin cambios no se carga el modelo: es lo que más tarda.
+    let embeddings = if chunks.is_empty() {
+        Vec::new()
+    } else {
+        // Se embebe "ruta > encabezados + texto": el contexto del trozo cuenta para la búsqueda.
+        let inputs: Vec<String> = chunks.iter().map(|c| format!("{}\n{}", c.heading, c.text)).collect();
+        load_embedder()?.embed(inputs, None)?
+    };
     let t_embed = t.elapsed();
 
-    if let Some(parent) = db.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let mut conn = Connection::open(db)?;
-    conn.execute_batch(&format!(
-        "DROP TABLE IF EXISTS chunks; DROP TABLE IF EXISTS vec; DROP TABLE IF EXISTS meta; DROP TABLE IF EXISTS fts;
-         CREATE TABLE meta (root TEXT NOT NULL);
-         CREATE TABLE chunks (id INTEGER PRIMARY KEY, path TEXT, heading TEXT, text TEXT);
-         CREATE VIRTUAL TABLE vec USING vec0(embedding float[{dim}] distance_metric=cosine);
-         CREATE VIRTUAL TABLE fts USING fts5(heading, text, tokenize='unicode61 remove_diacritics 2');"
-    ))?;
     let tx = conn.transaction()?;
-    tx.execute("INSERT INTO meta VALUES (?1)", [root.to_string_lossy()])?;
-    for (i, (c, e)) in chunks.iter().zip(&embeddings).enumerate() {
-        tx.execute(
-            "INSERT INTO chunks VALUES (?1, ?2, ?3, ?4)",
-            params![i as i64, c.path, c.heading, c.text],
-        )?;
-        tx.execute("INSERT INTO vec (rowid, embedding) VALUES (?1, ?2)", params![i as i64, as_bytes(e)])?;
-        tx.execute("INSERT INTO fts (rowid, heading, text) VALUES (?1, ?2, ?3)", params![i as i64, c.heading, c.text])?;
+    for path in known.keys().chain(changed.iter().map(|(rel, _, _)| rel)) {
+        let ids: Vec<i64> = tx
+            .prepare("SELECT id FROM chunks WHERE path = ?1")?
+            .query_map([path], |r| r.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        for id in ids {
+            tx.execute("DELETE FROM vec WHERE rowid = ?1", [id])?;
+            tx.execute("DELETE FROM fts WHERE rowid = ?1", [id])?;
+        }
+        tx.execute("DELETE FROM chunks WHERE path = ?1", [path])?;
+        tx.execute("DELETE FROM files WHERE path = ?1", [path])?;
+    }
+    for (c, e) in chunks.iter().zip(&embeddings) {
+        tx.execute("INSERT INTO chunks (path, heading, text) VALUES (?1, ?2, ?3)", params![c.path, c.heading, c.text])?;
+        let id = tx.last_insert_rowid();
+        tx.execute("INSERT INTO vec (rowid, embedding) VALUES (?1, ?2)", params![id, as_bytes(e)])?;
+        tx.execute("INSERT INTO fts (rowid, heading, text) VALUES (?1, ?2, ?3)", params![id, c.heading, c.text])?;
+    }
+    for (rel, hash, _) in &changed {
+        tx.execute("INSERT INTO files VALUES (?1, ?2)", [rel, hash])?;
     }
     tx.commit()?;
 
     eprintln!(
-        "{n_files} archivos, {} trozos, dim {dim} → {}\n  leer+trocear {:?} · modelo {:?} · embeddings {:?} · sqlite {:?}",
+        "{n_files} archivos: {} nuevos o cambiados ({} trozos), {} borrados → {}\n  leer+hash {:?} · modelo+embeddings {:?} · sqlite {:?}",
+        changed.len(),
         chunks.len(),
+        known.len(),
         db.display(),
         t_read,
-        t_model - t_read,
-        t_embed - t_model,
+        t_embed - t_read,
         t.elapsed() - t_embed,
     );
     Ok(())
