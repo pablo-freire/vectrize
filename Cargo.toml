@@ -2,6 +2,10 @@
 name = "vectrize"
 version = "0.1.0"
 edition = "2024"
+description = "Local semantic search over folders of Markdown documents, for the terminal and AI agents"
+repository = "https://github.com/pablofrr/vectrize"
+homepage = "https://github.com/pablofrr/vectrize"
+license = "MIT OR Apache-2.0"
 
 [dependencies]
 anyhow = "1.0.104"
@@ -12,6 +16,7 @@ hf-hub = { version = "0.4", default-features = false, features = ["ureq"] }
 ignore = "0.4.33"
 libc = "0.2.189"
 notify = "8.2.0"
+num_cpus = "1.17.0"
 pulldown-cmark = { version = "0.13.4", default-features = false }
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }
@@ -19,4 +24,9 @@ serde_json = "1.0.151"
 sqlite-vec = "0.1.9"
 text-splitter = { version = "0.33.0", features = ["markdown", "tokenizers"] }
 tokenizers = { version = "0.23.2", default-features = false }
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
 

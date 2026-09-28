@@ -38,8 +38,10 @@ const EMBEDDER_DIM: usize = 1024;
 const SCHEMA: i64 = 5;
 /// Max tokens per chunk. 256 beat 400 in our evaluation (the model truncates at 512).
 const CHUNK_TOKENS: usize = 256;
-/// Chunks per batch when indexing. Each batch is padded to its longest chunk: with fastembed's default (256),
-/// indexing a 33-note wiki peaked at 12.6 GB of RAM and took 60 s; one at a time, 1.7 GB and 26 s (2/4/8/16: slower).
+/// Chunks per batch when indexing. A batch is padded to its longest chunk: with fastembed's default (256), indexing a
+/// 33-note wiki peaked at 12.6 GB of RAM. One at a time wastes nothing: a ~256-token chunk already keeps the CPU busy,
+/// so sorting by length and batching by token budget (sentence-transformers, text-embeddings-inference) gained
+/// nothing here (27.0 s → 26.8 s).
 const EMBED_BATCH: usize = 1;
 /// Extensions read as plain text.
 const TEXT_EXTS: &[&str] = &["md", "mmd", "puml"];
@@ -63,7 +65,7 @@ const PROTOCOL: u32 = 1;
 const SKILL: &str = include_str!("../assets/SKILL.md");
 
 #[derive(Parser)]
-#[command(about = "Local semantic search over folders of documents")]
+#[command(version, about = "Local semantic search over folders of documents")]
 struct Cli {
     /// Index path.
     #[arg(long, global = true, env = "VECTRIZE_DB", default_value_os_t = default_db())]
@@ -216,6 +218,12 @@ fn main() -> Result<()> {
 // ---------------------------------------------------------------------------------------------------------------
 // Models
 
+/// One ONNX Runtime thread per physical core (its own default and advice) instead of fastembed's one per logical core:
+/// the two hardware threads of a core compete for the same vector units. Indexing: same speed (-4%), 39% less CPU.
+fn threads() -> usize {
+    num_cpus::get_physical()
+}
+
 /// The 4 tokenizer JSON files of a Hugging Face repo (cached in ~/.cache/huggingface).
 fn tokenizer_files(repo: &hf_hub::api::sync::ApiRepo) -> Result<TokenizerFiles> {
     let read = |f: &str| -> Result<Vec<u8>> { Ok(std::fs::read(repo.get(f)?)?) };
@@ -243,7 +251,7 @@ impl Models {
             let repo = hf_hub::api::sync::Api::new()?.model(EMBEDDER.into());
             let onnx = std::fs::read(repo.get(EMBEDDER_ONNX)?)?;
             let model = UserDefinedEmbeddingModel::new(onnx, tokenizer_files(&repo)?).with_pooling(Pooling::Cls);
-            let options = InitOptionsUserDefined::new();
+            let options = InitOptionsUserDefined::new().with_intra_threads(threads());
             self.embedder =
                 Some(TextEmbedding::try_new_from_user_defined(model, options).context("loading the model")?);
         }
@@ -266,7 +274,8 @@ impl Models {
         if self.reranker.is_none() {
             let repo = hf_hub::api::sync::Api::new()?.model(RERANKER.into());
             let model = UserDefinedRerankingModel::new(repo.get(RERANKER_ONNX)?, tokenizer_files(&repo)?);
-            let options = RerankInitOptionsUserDefined::new().with_max_length(RERANK_MAX_LENGTH);
+            let options =
+                RerankInitOptionsUserDefined::new().with_max_length(RERANK_MAX_LENGTH).with_intra_threads(threads());
             self.reranker =
                 Some(TextRerank::try_new_from_user_defined(model, options).context("loading the reranker")?);
         }
@@ -500,7 +509,7 @@ fn embed(
     let todo: Vec<usize> = (0..chunks.len()).filter(|&i| vectors[i].is_none()).collect();
     if !todo.is_empty() {
         let embedder = models.embedder()?; // only loaded if something changed: it is the slowest part
-        // In rounds, so we can show progress (the first index takes ~30 s).
+        // In rounds, so we can show progress (the first index takes a while).
         let show = todo.len() > 32 && std::io::stderr().is_terminal();
         for (n, part) in todo.chunks(16).enumerate() {
             // We embed "path > headings + text": the chunk's context counts for search.

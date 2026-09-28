@@ -1,22 +1,29 @@
 # vectrize
 
-Local search over folders of Markdown documents, from the CLI and for AI agents. Everything runs on your machine, on the CPU (for now).
+Local semantic search over folders of Markdown documents, built for you and your AI agents.
+Everything runs on your machine, on any laptop CPU: no GPU, no API keys.
 
-- **Hybrid search**: embeddings ([bge-m3](https://huggingface.co/BAAI/bge-m3), multilingual) + BM25, fused with RRF.
-  Finds paraphrases, not just matching words.
+- **Hybrid search**: embeddings ([bge-m3](https://huggingface.co/BAAI/bge-m3), multilingual) + BM25, fused with RRF. Finds paraphrases, not just matching words, in any language.
+- **Makes your agent faster**: Up to 10 seconds faster per question to your agent than grep.
 - **Always up to date**: a small daemon watches your folders and reindexes on save (~0.5 s), re-embedding only what changed.
-- **Fast**: ~30 ms per search once the daemon is running.
-- **Agent-friendly**: `--json` output with `file:line`, and a Claude Code skill.
+- **Fast**: ~20–30 ms per search once the daemon is running.
+
+![vectrize demo](assets/demo.gif)
 
 ## Install
 
-Requires Rust (1.89+). Linux and macOS are supported.
-
 ```sh
-cargo install --git https://github.com/pablo-freire/vectrize
+curl -LsSf https://github.com/pablofrr/vectrize/releases/latest/download/vectrize-installer.sh | sh
+# or
+brew install pablofrr/tap/vectrize
+# or, from source (Rust 1.89+)
+cargo install --git https://github.com/pablofrr/vectrize
 ```
 
-Note: The first run downloads the embedding model (~560 MB) from Hugging Face.
+macOS (Apple Silicon) and Linux (x86_64, arm64) with glibc 2.39+: Ubuntu 24.04, Debian 13, Fedora 40 or newer.
+On Windows, use WSL2 with your notes inside WSL (changes to files under `/mnt/c` are not picked up live).
+
+The first run downloads the embedding model (~560 MB) from Hugging Face.
 
 ## Usage
 
@@ -40,21 +47,31 @@ Other commands: `remove <folder>`, `stop`, `watch` (the daemon itself). See `vec
 
 ## For agents
 
-```sh
-vectrize search "question" --json -k 5
-```
+`vectrize setup` installs a [Claude Code](https://claude.com/claude-code) skill, so your agent searches your notes on
+its own. No MCP server, nothing to configure. Other agents can call `vectrize search "question" --json` directly.
 
-Returns the file (absolute path), line, heading path and full text of each chunk. `setup` installs a
-[Claude Code](https://claude.com/claude-code) skill that tells the agent when to use it; other agents can call the
-same command.
+Without it, the agent greps for words from your question, reads files, and greps again when the words don't match.
+With vectrize, one search usually lands on the right section, so it reads one file and answers. In our test:
 
-Search always returns `k` results, relevant or not: the agent should judge relevance itself.
+- **Faster**: Claude Code answered 30% faster (15.9 s instead of 22.8 s, median) with 14% fewer tokens.
+- **More reliable**: it found the right note in 20 of 20 runs, against 15 of 20 with grep alone (tbf i was surprised with this one, but for vague questions, it makes a difference).
+
+| question | grep | vectrize |
+|---|---|---|
+| what's most relevant in the OWASP audit we did? | 19.8 s | 20.5 s |
+| what's new in the Android app? | 13.1 s | 11.5 s |
+| what are our worst Android bugs? | 31.0 s | 17.9 s |
+| what did I think of the vendor's offering? | 32.7 s | 15.6 s |
+| **all (median)** | **22.8 s · 101k tokens** | **15.9 s · 87k tokens** |
+
+<sub>Claude Code, headless, same permissions in both setups. 4 questions about a real 33-note wiki, 5 runs each in
+alternating order; median time per answer. When a keyword is in the file name ("OWASP"), grep is just as fast.</sub>
 
 ## How it works
 
 - Markdown is split with [text-splitter](https://github.com/benbrandt/text-splitter) (≤256 tokens per chunk), keeping
   the heading path of each chunk as context. `.gitignore` and hidden files are respected.
 - One SQLite file holds everything: [sqlite-vec](https://github.com/asg017/sqlite-vec) for vectors, FTS5 for BM25.
-- The daemon keeps the model in memory (~1.1 GB) and unloads it after 30 min idle (~40 MB); the next search reloads it
+- The daemon keeps the model in memory (~1.1 GB, so be careful with lower end devices) and unloads it after 30 min idle (~40 MB); the next search reloads it
   (~1.3 s).
 
