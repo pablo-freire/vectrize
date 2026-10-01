@@ -28,7 +28,7 @@ The first run downloads the embedding model (~560 MB) from Hugging Face.
 ## Usage
 
 ```sh
-vectrize setup ~/notes                 # index a folder, start the daemon with your session, install the skill
+vectrize setup ~/notes                 # index a folder, start the daemon with your session
 vectrize add ~/work/project/docs       # add more folders
 vectrize search "how do we deploy the backend"
 vectrize search "ERR_TIMEOUT" --mode bm25       # exact identifiers
@@ -47,8 +47,15 @@ Other commands: `remove <folder>`, `stop`, `watch` (the daemon itself). See `vec
 
 ## For agents
 
-`vectrize setup` installs a [Claude Code](https://claude.com/claude-code) skill, so your agent searches your notes on
-its own. No MCP server, nothing to configure. Other agents can call `vectrize search "question" --json` directly.
+Install the [skill](skills/vectrize/SKILL.md) so your agent searches your notes on its own (Claude Code, Codex,
+Cursor, Copilot, Gemini CLI and any other agent that supports [Agent Skills](https://agentskills.io)):
+
+```sh
+npx skills add pablofrr/vectrize
+```
+
+Without Node, copy [`skills/vectrize`](skills/vectrize) into your agent's skills folder (e.g. `~/.claude/skills/`).
+No MCP server, nothing to configure. Any other agent can call `vectrize search "question" --json` directly.
 
 Without it, the agent greps for words from your question, reads files, and greps again when the words don't match.
 With vectrize, one search usually lands on the right section, so it reads one file and answers. In our test:

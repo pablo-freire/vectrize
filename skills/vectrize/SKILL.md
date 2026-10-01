@@ -1,6 +1,6 @@
 ---
 name: vectrize
-description: Local semantic search over the documents in {roots} (notes, docs, specs, runbooks). Use it BEFORE Grep/Glob whenever a question could be answered by those documents, or to find where a topic is covered. Understands paraphrases and other languages, and returns the relevant passages with file:line in ~30 ms.
+description: Local semantic search over the user's indexed documentation (notes, docs, specs, PRDs, runbooks). Use it BEFORE Grep/Glob whenever a question could be answered by documentation, or to find where a topic is covered. Understands paraphrases and other languages, and returns the relevant passages with file:line in ~30 ms.
 ---
 
 # vectrize
