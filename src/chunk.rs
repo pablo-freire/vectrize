@@ -1,6 +1,4 @@
-//! Markdown → chunks. `text-splitter` does the splitting (by the largest Markdown unit that fits, sized in tokens of
-//! the embedding model); here we only add what it doesn't give: the path of headings above each chunk, used as
-//! context, and the line where the chunk starts.
+//! Markdown → chunks: `text-splitter` splits; this adds each chunk's heading path and start line.
 
 use std::borrow::Cow;
 use std::ops::Range;
@@ -22,7 +20,7 @@ pub fn chunk_markdown<S: ChunkSizer>(path: &str, content: &str, splitter: &Markd
     splitter
         .chunk_indices(&content)
         .map(|(offset, text)| {
-            let mut stack: Vec<(usize, &str)> = Vec::new(); // (level, title) of the headings above
+            let mut stack: Vec<(usize, &str)> = Vec::new(); // (level, title)
             for (_, level, title) in headings.iter().take_while(|(start, _, _)| *start <= offset) {
                 stack.retain(|(l, _)| l < level);
                 stack.push((*level, title));
@@ -56,7 +54,7 @@ fn headings(md: &str) -> Vec<(usize, usize, String)> {
     out
 }
 
-/// Excalidraw drawings (```compressed-json blocks) are base64 noise: blank them out, keeping the line count.
+/// Blanks Excalidraw drawings (base64 noise), keeping line numbers.
 fn blank_drawings(md: &str) -> Cow<'_, str> {
     let drawings: Vec<Range<usize>> = Parser::new(md)
         .into_offset_iter()
@@ -84,7 +82,7 @@ mod tests {
     use super::*;
 
     fn chunks(md: &str, chars: usize) -> Vec<(String, String, usize)> {
-        let splitter = MarkdownSplitter::new(chars); // sized in characters: no model needed
+        let splitter = MarkdownSplitter::new(chars);
         chunk_markdown("dir/Doc.md", md, &splitter).into_iter().map(|c| (c.heading, c.text, c.line)).collect()
     }
 

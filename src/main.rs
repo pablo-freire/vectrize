@@ -1,9 +1,4 @@
-//! vectrize: local semantic search over folders of documents.
-//!
-//! Split by headings → embeddings (bge-m3 int8) in sqlite-vec + BM25 (FTS5), fused with RRF.
-//! Optional: rerank the top hits with a cross-encoder (`--rerank`).
-//! Indexing is incremental: only files whose hash (blake3) changed are re-embedded, and deleted files are dropped.
-//! One index and one daemon serve every folder, so the model is loaded once however many folders there are.
+//! Local semantic search: Markdown chunks embedded (bge-m3) in sqlite-vec + BM25 (FTS5), fused with RRF.
 
 mod chunk;
 
@@ -28,40 +23,27 @@ use serde::{Deserialize, Serialize};
 use chunk::{Chunk, chunk_markdown};
 use text_splitter::{ChunkConfig, MarkdownSplitter};
 
-/// bge-m3 (MIT, multilingual) quantized to int8: 559 MB, same quality as fp32 in our evaluation.
-/// Unlike potion (static embeddings) it handles paraphrased queries.
 const EMBEDDER: &str = "onnx-community/bge-m3-ONNX";
 const EMBEDDER_ONNX: &str = "onnx/model_int8.onnx";
 const EMBEDDER_DIM: usize = 1024;
 /// Version of the schema and the chunker: if it changes, the index is rebuilt.
-/// 2: `chunks.line`. 3: tasks and bold titles. 4: several folders (`roots`). 5: text-splitter, `files.mtime/size`.
 const SCHEMA: i64 = 5;
-/// Max tokens per chunk. 256 beat 400 in our evaluation (the model truncates at 512).
+/// Max tokens per chunk (the model truncates at 512).
 const CHUNK_TOKENS: usize = 256;
-/// Chunks per batch when indexing. A batch is padded to its longest chunk: with fastembed's default (256), indexing a
-/// 33-note wiki peaked at 12.6 GB of RAM. One at a time wastes nothing: a ~256-token chunk already keeps the CPU busy,
-/// so sorting by length and batching by token budget (sentence-transformers, text-embeddings-inference) gained
-/// nothing here (27.0 s → 26.8 s).
+/// A batch is padded to its longest chunk, so larger batches cost a lot of RAM and are not faster on CPU.
 const EMBED_BATCH: usize = 1;
-/// Extensions read as plain text.
 const TEXT_EXTS: &[&str] = &["md", "mmd", "puml"];
-/// Multilingual cross-encoder, Apache-2.0. The int8 variant uses AVX-512 VNNI.
 const RERANKER: &str = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1";
 const RERANKER_ONNX: &str = "onnx/model_qint8_avx512_vnni.onnx";
-/// With 10 we lose hits that BM25 ranks between 11 and 20.
 const RERANK_CANDIDATES: usize = 20;
-/// Max tokens per (query, chunk) pair.
 const RERANK_MAX_LENGTH: usize = 256;
-/// Candidates each retriever contributes before fusion.
 const CANDIDATES: i64 = 50;
-/// Quiet period `watch` waits for after an event before reindexing.
 const DEBOUNCE: Duration = Duration::from_millis(300);
-/// How often `watch` checks for added/removed folders and whether to unload the models.
 const IDLE_CHECK: Duration = Duration::from_secs(10);
-/// Version of the daemon protocol. A daemon from another version (of the protocol or the schema) answers `STALE`
-/// and exits, so after an upgrade the next search starts a new one.
+/// Version of the daemon protocol: one line (`STATUS`, `STOP` or `<version> <JSON query>`) → the response, or
+/// `ERR message`. A daemon from another version (of the protocol or the schema) answers `ERR STALE` and exits, so
+/// after an upgrade the next search starts a new one.
 const PROTOCOL: u32 = 1;
-/// Claude Code skill installed by `setup`; `{roots}` are the indexed folders.
 const SKILL: &str = include_str!("../assets/SKILL.md");
 
 #[derive(Parser)]
@@ -96,14 +78,12 @@ enum Cmd {
     Stop,
     /// Daemon: watch every indexed folder (reindex on save) and serve searches with the models in memory.
     Watch {
-        /// Minutes without searching or indexing after which the models are unloaded (~1 GB → ~40 MB; the next
-        /// search takes ~1 s to reload them). 0 = always warm. The daemon started by `search` reads the env variable.
+        /// Minutes idle after which the models are unloaded (0 = never).
         #[arg(long, env = "VECTRIZE_UNLOAD_AFTER", default_value_t = 30.0)]
         unload_after: f64,
     },
 }
 
-/// A search, as typed on the command line and as sent to the daemon.
 #[derive(clap::Args, Serialize, Deserialize)]
 struct Query {
     text: String,
@@ -111,7 +91,7 @@ struct Query {
     k: usize,
     #[arg(long, value_enum, default_value_t = Mode::Hybrid)]
     mode: Mode,
-    /// Rerank the top hits with a cross-encoder (+~1 s; did not beat hybrid in our evaluation).
+    /// Rerank the top hits with a cross-encoder (slower).
     #[arg(long)]
     rerank: bool,
     /// Only search this folder.
@@ -134,7 +114,6 @@ struct Hit {
     text: String,
 }
 
-/// A file on disk that differs from what the index has.
 struct File {
     root: i64,
     path: String, // relative to its root
@@ -144,12 +123,11 @@ struct File {
     content: String,
 }
 
-/// What changed in the folders since the last sync.
 #[derive(Default)]
 struct Scan {
-    changed: Vec<File>,          // new or modified content
-    touched: Vec<File>,          // same content, new mtime (e.g. saved without changes): only `files` is updated
-    deleted: Vec<(i64, String)>, // (root, path) gone from disk
+    changed: Vec<File>,
+    touched: Vec<File>,          // same content, new mtime
+    deleted: Vec<(i64, String)>, // (root, path)
 }
 
 fn default_db() -> PathBuf {
@@ -161,10 +139,9 @@ fn default_db() -> PathBuf {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    // Rust ignores SIGPIPE and `println!` panics on `vectrize search … | head`; this makes the process exit quietly.
+    // Otherwise `println!` panics on `vectrize search … | head`.
     unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
     // sqlite-vec is statically linked; this registers it on every connection we open.
-    // `unsafe` because it is FFI: Rust cannot check the C function's signature.
     unsafe {
         use rusqlite::ffi::{sqlite3, sqlite3_api_routines};
         type Init = unsafe extern "C" fn(*mut sqlite3, *mut *mut std::ffi::c_char, *const sqlite3_api_routines) -> i32;
@@ -174,22 +151,15 @@ fn main() -> Result<()> {
     }
     let db = &cli.db;
     match cli.cmd {
-        Cmd::Add { dir } => {
-            sync(db, Some(&dir), &mut Models::default())?;
-            install_skill(db, false)
-        }
-        Cmd::Remove { dir } => {
-            remove(db, &dir)?;
-            install_skill(db, false)
-        }
+        Cmd::Add { dir } => sync(db, Some(&dir), &mut Models::default()),
+        Cmd::Remove { dir } => remove(db, &dir),
         Cmd::Search { mut query, json } => {
             if let Some(dir) = &query.scope {
                 query.scope = Some(dir.canonicalize().with_context(|| format!("{} does not exist", dir.display()))?);
             }
             let hits = match ask_daemon(db, &format!("{} {}", version(), serde_json::to_string(&query)?)) {
                 Ok(out) => serde_json::from_str(&out)?,
-                // No daemon (or it died mid-connection): like Gradle's, this search runs cold and leaves the
-                // daemon starting for the next ones. Errors from the daemon itself (bad folder…) are real errors.
+                // No daemon or an outdated one: search cold and start one for the next searches.
                 Err(e) if e.is::<std::io::Error>() || e.to_string() == "STALE" => {
                     match spawn_daemon(db) {
                         Ok(()) => eprintln!("(starting the daemon; this search runs cold, the next ones warm)"),
@@ -215,16 +185,11 @@ fn main() -> Result<()> {
     }
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// Models
-
-/// One ONNX Runtime thread per physical core (its own default and advice) instead of fastembed's one per logical core:
-/// the two hardware threads of a core compete for the same vector units. Indexing: same speed (-4%), 39% less CPU.
+/// Hyperthreads share vector units: more threads than physical cores only burns CPU.
 fn threads() -> usize {
     num_cpus::get_physical()
 }
 
-/// The 4 tokenizer JSON files of a Hugging Face repo (cached in ~/.cache/huggingface).
 fn tokenizer_files(repo: &hf_hub::api::sync::ApiRepo) -> Result<TokenizerFiles> {
     let read = |f: &str| -> Result<Vec<u8>> { Ok(std::fs::read(repo.get(f)?)?) };
     Ok(TokenizerFiles {
@@ -235,7 +200,6 @@ fn tokenizer_files(repo: &hf_hub::api::sync::ApiRepo) -> Result<TokenizerFiles> 
     })
 }
 
-/// Models loaded on demand and kept: the daemon loads them once and uses them for everything.
 #[derive(Default)]
 struct Models {
     embedder: Option<TextEmbedding>,
@@ -258,10 +222,10 @@ impl Models {
         Ok(self.embedder.as_mut().unwrap())
     }
 
-    /// Built once: cloning the tokenizer (250k tokens of vocabulary) takes ~150 ms.
+    /// Cached: cloning the tokenizer is slow.
     fn splitter(&mut self) -> Result<&MarkdownSplitter<tokenizers::Tokenizer>> {
         if self.splitter.is_none() {
-            // Sized with the model's own tokenizer, without its truncation (it would cap every count at 512).
+            // Without truncation, or every count would be capped at 512.
             let mut tokenizer = self.embedder()?.tokenizer.clone();
             tokenizer.with_truncation(None).map_err(anyhow::Error::msg)?.with_padding(None);
             self.splitter = Some(MarkdownSplitter::new(ChunkConfig::new(CHUNK_TOKENS).with_sizer(tokenizer)));
@@ -282,7 +246,6 @@ impl Models {
         Ok(self.reranker.as_mut().unwrap())
     }
 
-    /// Unloads the models if they have been idle for `after`. Returns whether it did.
     fn unload_if_idle(&mut self, after: Duration) -> bool {
         let loaded = self.embedder.is_some() || self.reranker.is_some();
         if !loaded || self.last_use.is_none_or(|t| t.elapsed() < after) {
@@ -296,7 +259,7 @@ impl Models {
     }
 }
 
-/// Returns free heap memory to the OS after unloading the models: without it RSS barely drops (~600 MB kept).
+/// Without this, freed model memory stays in the process.
 fn release_memory() {
     #[cfg(all(target_os = "linux", target_env = "gnu"))]
     unsafe {
@@ -313,9 +276,6 @@ unsafe extern "C" {
     /// Not in the `libc` crate.
     fn malloc_zone_pressure_relief(zone: *mut std::ffi::c_void, goal: usize) -> usize;
 }
-
-// ---------------------------------------------------------------------------------------------------------------
-// Index
 
 fn schema_sql() -> String {
     format!(
@@ -335,19 +295,12 @@ fn schema_sql() -> String {
     )
 }
 
-/// Indexed folders, as `(id, path)`. Before schema 4 there was a single one, in `meta.root`: kept on rebuild.
 fn roots(conn: &Connection) -> Vec<(i64, PathBuf)> {
-    let current = conn
-        .prepare("SELECT id, path FROM roots ORDER BY id")
-        .and_then(|mut stmt| stmt.query_map([], |r| Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?))))?.collect());
-    current
-        .or_else(|_| {
-            conn.query_row("SELECT root FROM meta", [], |r| Ok(vec![(1, PathBuf::from(r.get::<_, String>(0)?))]))
-        })
+    conn.prepare("SELECT id, path FROM roots ORDER BY id")
+        .and_then(|mut stmt| stmt.query_map([], |r| Ok((r.get(0)?, PathBuf::from(r.get::<_, String>(1)?))))?.collect())
         .unwrap_or_default()
 }
 
-/// Brings the index up to date with every folder (plus `add`, if given). Only re-embeds what changed.
 fn sync(db: &Path, add: Option<&Path>, models: &mut Models) -> Result<()> {
     let t = Instant::now();
     if let Some(parent) = db.parent() {
@@ -357,9 +310,8 @@ fn sync(db: &Path, add: Option<&Path>, models: &mut Models) -> Result<()> {
     let model = format!("{EMBEDDER}/{EMBEDDER_ONNX}");
     let stored: Option<(String, i64)> =
         conn.query_row("SELECT model, schema FROM meta", [], |r| Ok((r.get(0)?, r.get(1)?))).ok();
-    // A new model or format makes everything stored useless. The rebuild runs in the same transaction as the
-    // inserts: while the embeddings are computed (~30 s), searches keep seeing the previous index, not an empty one.
-    // Never rebuild backwards: an older binary (e.g. a daemon still running after an upgrade) would undo the new index.
+    // The rebuild shares the inserts' transaction, so searches see the old index until it commits. An older binary
+    // (e.g. a daemon left running after an upgrade) must not rebuild a newer index.
     anyhow::ensure!(stored.as_ref().is_none_or(|(_, v)| *v <= SCHEMA), "the index was built by a newer vectrize");
     let rebuild = stored != Some((model.clone(), SCHEMA));
     if rebuild && stored.is_some() {
@@ -440,13 +392,11 @@ fn sync(db: &Path, add: Option<&Path>, models: &mut Models) -> Result<()> {
     Ok(())
 }
 
-/// Compares `root` on disk with what the index has, adding the differences to `scan`.
 fn scan_root(conn: &Connection, id: i64, root: &Path, rebuild: bool, scan: &mut Scan) -> Result<()> {
     if !root.is_dir() {
         eprintln!("warning: {} is missing; keeping what was indexed (`vectrize remove` drops it)", root.display());
         return Ok(());
     }
-    // Whatever is left in `known` after walking the folder was deleted from disk.
     let mut known: HashMap<String, (String, i64, i64)> = if rebuild {
         HashMap::new()
     } else {
@@ -454,7 +404,7 @@ fn scan_root(conn: &Connection, id: i64, root: &Path, rebuild: bool, scan: &mut 
             .query_map([id], |r| Ok((r.get(0)?, (r.get(1)?, r.get(2)?, r.get(3)?))))?
             .collect::<rusqlite::Result<_>>()?
     };
-    // `ignore` skips what `.gitignore` says, and hidden files and folders (`.git`, `.obsidian`…).
+    // Skips gitignored and hidden files.
     for entry in ignore::WalkBuilder::new(root).require_git(false).build() {
         let entry = entry?;
         let path = entry.path();
@@ -467,8 +417,6 @@ fn scan_root(conn: &Connection, id: i64, root: &Path, rebuild: bool, scan: &mut 
         let (mtime, size) = (i64::try_from(mtime)?, i64::try_from(meta.len())?);
         let rel = path.strip_prefix(root)?.to_string_lossy().into_owned();
         let old = known.remove(&rel);
-        // Same mtime and size: unchanged, without reading it (with thousands of files, reading and hashing
-        // them all on every save would take seconds).
         if old.as_ref().is_some_and(|(_, m, s)| (*m, *s) == (mtime, size)) {
             continue;
         }
@@ -482,8 +430,7 @@ fn scan_root(conn: &Connection, id: i64, root: &Path, rebuild: bool, scan: &mut 
     Ok(())
 }
 
-/// One vector per chunk, and how many had to be computed. An edit usually touches one chunk: chunks that stay
-/// identical (heading and text) keep their vector. A rebuild reuses nothing: the model may have changed.
+/// One vector per chunk, and how many were computed. Unchanged chunks keep their vector, except on a rebuild.
 fn embed(
     conn: &Connection,
     chunks: &[(&File, Chunk)],
@@ -508,11 +455,9 @@ fn embed(
         chunks.iter().map(|(f, c)| old.remove(&(f.root, c.heading.clone(), c.text.clone()))).collect();
     let todo: Vec<usize> = (0..chunks.len()).filter(|&i| vectors[i].is_none()).collect();
     if !todo.is_empty() {
-        let embedder = models.embedder()?; // only loaded if something changed: it is the slowest part
-        // In rounds, so we can show progress (the first index takes a while).
+        let embedder = models.embedder()?;
         let show = todo.len() > 32 && std::io::stderr().is_terminal();
         for (n, part) in todo.chunks(16).enumerate() {
-            // We embed "path > headings + text": the chunk's context counts for search.
             let inputs: Vec<String> =
                 part.iter().map(|&i| format!("{}\n{}", chunks[i].1.heading, chunks[i].1.text)).collect();
             for (i, e) in part.iter().zip(embedder.embed(inputs, Some(EMBED_BATCH))?) {
@@ -544,7 +489,7 @@ fn delete_file(tx: &Connection, root: i64, path: &str) -> Result<()> {
 }
 
 fn remove(db: &Path, dir: &Path) -> Result<()> {
-    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()); // it may already be gone from disk
+    let dir = dir.canonicalize().unwrap_or_else(|_| dir.to_path_buf()); // may be gone from disk
     let mut conn = Connection::open(db)?;
     let (id, _) = roots(&conn).into_iter().find(|(_, r)| *r == dir).with_context(|| not_indexed(&dir))?;
     let tx = conn.transaction()?;
@@ -565,12 +510,9 @@ fn not_indexed(dir: &Path) -> String {
     format!("{} is not an indexed folder (see `vectrize status`)", dir.display())
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// Search
-
 fn search(db: &Path, query: &Query, models: &mut Models) -> Result<Vec<Hit>> {
     let conn = Connection::open(db).with_context(|| format!("no index at {}", db.display()))?;
-    // Never a silent empty result: an agent reads it as "nothing there" and gives up on the tool.
+    // An empty result would read as "nothing there": fail loudly instead.
     let usable = conn
         .query_row("SELECT schema = ?1 AND EXISTS (SELECT 1 FROM chunks) FROM meta", [SCHEMA], |r| r.get(0))
         .unwrap_or(false);
@@ -581,10 +523,9 @@ fn search(db: &Path, query: &Query, models: &mut Models) -> Result<Vec<Hit>> {
          Otherwise, add a folder with `vectrize add <folder>`.",
         db.display()
     );
-    let scope = match &query.scope {
-        Some(dir) => Some(roots(&conn).into_iter().find(|(_, r)| r == dir).with_context(|| not_indexed(dir))?.0),
-        None => None,
-    };
+    let scope = (query.scope.as_ref())
+        .map(|dir| roots(&conn).into_iter().find(|(_, r)| r == dir).map(|(id, _)| id).with_context(|| not_indexed(dir)))
+        .transpose()?;
     let filter = if scope.is_some() { " AND root = ?3" } else { "" };
     let ids = |sql: &str, arg: &dyn ToSql| -> Result<Vec<i64>> {
         let mut args: Vec<&dyn ToSql> = vec![arg, &CANDIDATES];
@@ -601,7 +542,7 @@ fn search(db: &Path, query: &Query, models: &mut Models) -> Result<Vec<Hit>> {
         lists.push(ids(&sql, &q)?);
     }
     if query.mode != Mode::Vec {
-        // Each word quoted (so `¿` or `-` are not FTS5 syntax), joined with OR.
+        // Quoted so punctuation is not FTS5 syntax.
         let words: Vec<_> = query.text.split(|c: char| !c.is_alphanumeric()).filter(|w| !w.is_empty()).collect();
         let q = words.iter().map(|w| format!("\"{w}\"")).collect::<Vec<_>>().join(" OR ");
         if !q.is_empty() {
@@ -638,8 +579,7 @@ fn search(db: &Path, query: &Query, models: &mut Models) -> Result<Vec<Hit>> {
     ranked.into_iter().take(query.k).map(|(id, _)| hit(id)).collect()
 }
 
-/// Reciprocal Rank Fusion: each list adds 1/(60 + rank). It only uses positions, so it doesn't matter
-/// that cosine and BM25 live on different scales.
+/// Reciprocal Rank Fusion: ranks only, so cosine and BM25 scales don't matter.
 fn rrf(lists: &[Vec<i64>]) -> Vec<(i64, f64)> {
     let mut scores: HashMap<i64, f64> = HashMap::new();
     for list in lists {
@@ -652,7 +592,7 @@ fn rrf(lists: &[Vec<i64>]) -> Vec<(i64, f64)> {
     out
 }
 
-/// Formats results on the client side, so paths are relative to wherever the user searched from.
+/// Client side, so paths are relative to the caller's cwd.
 fn render(hits: &[Hit], json: bool) -> Result<String> {
     if json {
         return Ok(serde_json::to_string_pretty(hits)? + "\n");
@@ -660,7 +600,6 @@ fn render(hits: &[Hit], json: bool) -> Result<String> {
     let cwd = std::env::current_dir().unwrap_or_default();
     let mut out = String::new();
     for h in hits {
-        // `path:line` is clickable in terminals and editors. The heading without the file name (already in the path).
         let file = h.file.strip_prefix(&cwd).unwrap_or(&h.file);
         let section = h.heading.split_once(" > ").map_or("", |(_, rest)| rest);
         writeln!(out, "{}:{}  {section}\n  {}\n", file.display(), h.line, snippet(&h.text, 200))?;
@@ -668,7 +607,6 @@ fn render(hits: &[Hit], json: bool) -> Result<String> {
     Ok(out)
 }
 
-/// sqlite-vec expects the f32s as contiguous little-endian bytes.
 fn as_bytes(v: &[f32]) -> Vec<u8> {
     v.iter().flat_map(|x| x.to_le_bytes()).collect()
 }
@@ -676,20 +614,15 @@ fn as_bytes(v: &[f32]) -> Vec<u8> {
 fn snippet(text: &str, max: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
     match flat.char_indices().nth(max) {
-        Some((i, _)) => format!("{}…", &flat[..i]), // cut by char, not byte: UTF-8
+        Some((i, _)) => format!("{}…", &flat[..i]),
         None => flat,
     }
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// Daemon
-
-/// The daemon's socket lives next to the index: each `--db` has its own.
 fn socket_path(db: &Path) -> PathBuf {
     db.with_extension("sock")
 }
 
-/// Starts `watch` detached from the terminal. Its output goes to `<db>.log`.
 fn spawn_daemon(db: &Path) -> Result<()> {
     use std::os::unix::process::CommandExt as _;
     let log = std::fs::OpenOptions::new().create(true).append(true).open(db.with_extension("log"))?;
@@ -700,14 +633,14 @@ fn spawn_daemon(db: &Path) -> Result<()> {
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone()?)
         .stderr(log)
-        .process_group(0) // outside the terminal's process group: closing it doesn't kill the daemon
+        .process_group(0) // survives closing the terminal
         .spawn()?;
     Ok(())
 }
 
 fn watch(db: &Path, unload_after_min: f64) -> Result<()> {
     let unload_after = (unload_after_min > 0.0).then(|| Duration::from_secs_f64(unload_after_min * 60.0));
-    // One daemon per index: two searches in a row without a daemon would start two. The lock is released on exit.
+    // One daemon per index.
     let lock = std::fs::File::create(db.with_extension("lock"))?;
     if lock.try_lock().is_err() {
         eprintln!("a daemon is already running for {}", db.display());
@@ -715,19 +648,17 @@ fn watch(db: &Path, unload_after_min: f64) -> Result<()> {
     }
     anyhow::ensure!(!roots(&Connection::open(db)?).is_empty(), "no folders indexed; run `vectrize add <folder>`");
     let models = Mutex::new(Models::default());
-    sync(db, None, &mut models.lock().unwrap())?; // whatever changed while the daemon was off
-    models.lock().unwrap().embedder()?; // preloaded: the first search is already warm
+    sync(db, None, &mut models.lock().unwrap())?;
+    models.lock().unwrap().embedder()?;
 
     let sock = socket_path(db);
-    let _ = std::fs::remove_file(&sock); // leftovers from a previous daemon
+    let _ = std::fs::remove_file(&sock);
     let listener = UnixListener::bind(&sock).with_context(|| format!("creating {}", sock.display()))?;
     let (tx, rx) = std::sync::mpsc::channel();
     let mut watcher = notify::recommended_watcher(tx)?;
     let mut watched = HashSet::new();
     eprintln!("serving searches on {} (Ctrl+C to quit)", sock.display());
 
-    // One thread serves searches and another reindexes. They share the models: a search that arrives during
-    // a reindex waits for it to finish (~0.3 s).
     std::thread::scope(|s| {
         s.spawn(|| {
             for stream in listener.incoming() {
@@ -736,11 +667,9 @@ fn watch(db: &Path, unload_after_min: f64) -> Result<()> {
                 }
             }
         });
-        // Reading files also generates events (`sync` itself reads them): only writes count. Anything else is left
-        // to `sync`, which only stats files whose mtime and size didn't change.
+        // `sync` reads files too: ignore access events or it would loop.
         let relevant = |ev: &notify::Result<notify::Event>| ev.as_ref().is_ok_and(|ev| !ev.kind.is_access());
         loop {
-            // Folders added or removed (`vectrize add/remove`) since the last round.
             let current: HashSet<PathBuf> = roots(&Connection::open(db)?).into_iter().map(|(_, r)| r).collect();
             for dir in current.difference(&watched) {
                 match watcher.watch(dir, notify::RecursiveMode::Recursive) {
@@ -766,17 +695,15 @@ fn watch(db: &Path, unload_after_min: f64) -> Result<()> {
             if !ev.is_some_and(|ev| relevant(&ev)) {
                 continue;
             }
-            // A save arrives as a burst of events: wait for it to settle before reindexing.
+            // Debounce: a save is a burst of events.
             while rx.recv_timeout(DEBOUNCE).is_ok() {}
             if let Err(e) = sync(db, None, &mut models.lock().unwrap()) {
-                eprintln!("error: {e:#}"); // e.g. a half-written file; the next save fixes it
+                eprintln!("error: {e:#}");
             }
         }
     })
 }
 
-/// Protocol: one line (`STATUS`, `STOP` or `<version> <JSON query>`) → the response (JSON hits for a query),
-/// or `ERR message`.
 fn version() -> String {
     format!("{PROTOCOL}.{SCHEMA}")
 }
@@ -804,7 +731,7 @@ fn serve(mut stream: UnixStream, db: &Path, models: &Mutex<Models>) -> Result<()
         "STOP" => {
             stream.write_all(b"ok")?;
             let _ = std::fs::remove_file(socket_path(db));
-            std::process::exit(0); // a half-done sync is discarded whole: it runs in a transaction
+            std::process::exit(0); // a sync in progress rolls back
         }
         request => match request.split_once(' ') {
             Some((version, query)) if version == self::version() => serde_json::from_str(query)
@@ -830,15 +757,12 @@ fn rss_mb() -> Result<u64> {
     Ok(String::from_utf8(out.stdout)?.trim().parse::<u64>()? / 1024) // KB on Linux and macOS
 }
 
-// ---------------------------------------------------------------------------------------------------------------
-// Setup and status
-
 fn home() -> Result<PathBuf> {
     Ok(PathBuf::from(std::env::var_os("HOME").context("HOME is not set")?))
 }
 
 fn setup(db: &Path, dir: &Path) -> Result<()> {
-    let _ = ask_daemon(db, "STOP"); // the service's daemon replaces it
+    let _ = ask_daemon(db, "STOP");
     sync(db, Some(dir), &mut Models::default())?;
     let (service, ok) = install_service(db)?;
     println!();
@@ -850,7 +774,7 @@ fn setup(db: &Path, dir: &Path) -> Result<()> {
     } else {
         println!("! Could not enable {}; the daemon will start with the first search.", service.display());
     }
-    install_skill(db, true)?;
+    install_skill(db)?;
     println!("\nTry:     vectrize search \"your question\"");
     println!("More:    vectrize add <another folder> · vectrize status");
     println!(
@@ -859,8 +783,7 @@ fn setup(db: &Path, dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Starts the daemon with the user's session: a systemd user service on Linux, a LaunchAgent on macOS.
-/// Returns the service file and whether it was enabled.
+/// systemd user service or LaunchAgent. Returns the file and whether it was enabled.
 fn install_service(db: &Path) -> Result<(PathBuf, bool)> {
     let exe = std::env::current_exe()?;
     let run = |cmd: &str, args: &[&str]| std::process::Command::new(cmd).args(args).status().is_ok_and(|s| s.success());
@@ -892,7 +815,7 @@ fn install_service(db: &Path) -> Result<(PathBuf, bool)> {
         )?;
         let domain = format!("gui/{}", unsafe { libc::getuid() });
         let plist = file.to_string_lossy();
-        let _ = run("launchctl", &["bootout", &domain, &plist]); // a previous copy
+        let _ = run("launchctl", &["bootout", &domain, &plist]);
         Ok((file.clone(), run("launchctl", &["bootstrap", &domain, &plist])))
     } else {
         std::fs::write(
@@ -911,21 +834,16 @@ fn install_service(db: &Path) -> Result<(PathBuf, bool)> {
     }
 }
 
-/// Writes the Claude Code skill with the indexed folders (it tells the agent when to use vectrize). Without
-/// `create`, only refreshes a skill that `setup` already installed.
-fn install_skill(db: &Path, create: bool) -> Result<()> {
+fn install_skill(db: &Path) -> Result<()> {
     let home = home()?;
     let skill = home.join(".claude/skills/vectrize/SKILL.md");
-    // The skill describes the default index: an index in another `--db` (tests, experiments) must not clobber it.
-    if db != default_db() || !(create && home.join(".claude").is_dir() || skill.exists()) {
+    // Not for tests or other `--db`s.
+    if db != default_db() || !home.join(".claude").is_dir() {
         return Ok(());
     }
-    let roots: Vec<String> = roots(&Connection::open(db)?).iter().map(|(_, r)| r.display().to_string()).collect();
     std::fs::create_dir_all(skill.parent().unwrap())?;
-    std::fs::write(&skill, SKILL.replace("{roots}", &roots.join(", ")))?;
-    if create {
-        println!("✓ Claude Code skill installed ({}).", skill.display());
-    }
+    std::fs::write(&skill, SKILL)?;
+    println!("✓ Claude Code skill installed ({}).", skill.display());
     Ok(())
 }
 
@@ -952,7 +870,7 @@ fn status(db: &Path) -> Result<()> {
         3600..86400 => format!("{} h", age / 3600),
         _ => format!("{} d", age / 86400),
     };
-    // Lock held but no socket: the daemon exists and is still bringing the index up to date.
+    // Lock held but no socket yet: the daemon is still syncing.
     let starting = std::fs::File::open(db.with_extension("lock")).is_ok_and(|f| f.try_lock().is_err());
     let daemon = ask_daemon(db, "STATUS").unwrap_or_else(|_| {
         if starting { "starting (bringing the index up to date)" } else { "off (the next search starts it)" }.into()
@@ -968,7 +886,6 @@ mod tests {
 
     #[test]
     fn rrf_rewards_agreement_between_lists() {
-        // 2 is second in both lists; 1 and 3 are first in only one.
         let fused: Vec<i64> = rrf(&[vec![1, 2], vec![3, 2]]).into_iter().map(|(id, _)| id).collect();
         assert_eq!(fused, [2, 1, 3]);
     }
