@@ -1,7 +1,8 @@
 [package]
 name = "vectrize"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.89"
 description = "Local semantic search over folders of Markdown documents, for the terminal and AI agents"
 repository = "https://github.com/pablofrr/vectrize"
 homepage = "https://github.com/pablofrr/vectrize"
