@@ -44,7 +44,6 @@ const IDLE_CHECK: Duration = Duration::from_secs(10);
 /// `ERR message`. A daemon from another version (of the protocol or the schema) answers `ERR STALE` and exits, so
 /// after an upgrade the next search starts a new one.
 const PROTOCOL: u32 = 1;
-const SKILL: &str = include_str!("../assets/SKILL.md");
 
 #[derive(Parser)]
 #[command(version, about = "Local semantic search over folders of documents")]
@@ -72,7 +71,7 @@ enum Cmd {
     },
     /// Indexed folders and daemon state.
     Status,
-    /// First-time setup: add the folder, start the daemon with your session (systemd/launchd) and install the Claude Code skill.
+    /// First-time setup: add the folder and start the daemon with your session (systemd/launchd).
     Setup { dir: PathBuf },
     /// Stop the daemon (the next search starts it again).
     Stop,
@@ -774,8 +773,8 @@ fn setup(db: &Path, dir: &Path) -> Result<()> {
     } else {
         println!("! Could not enable {}; the daemon will start with the first search.", service.display());
     }
-    install_skill(db)?;
-    println!("\nTry:     vectrize search \"your question\"");
+    println!("\nAgents:  npx skills add pablofrr/vectrize");
+    println!("Try:     vectrize search \"your question\"");
     println!("More:    vectrize add <another folder> · vectrize status");
     println!(
         "Memory:  models are unloaded after 30 min idle (set VECTRIZE_UNLOAD_AFTER=0 in the service to keep them)."
@@ -832,19 +831,6 @@ fn install_service(db: &Path) -> Result<(PathBuf, bool)> {
             && run("systemctl", &["--user", "enable", "--now", "vectrize"]);
         Ok((file, ok))
     }
-}
-
-fn install_skill(db: &Path) -> Result<()> {
-    let home = home()?;
-    let skill = home.join(".claude/skills/vectrize/SKILL.md");
-    // Not for tests or other `--db`s.
-    if db != default_db() || !home.join(".claude").is_dir() {
-        return Ok(());
-    }
-    std::fs::create_dir_all(skill.parent().unwrap())?;
-    std::fs::write(&skill, SKILL)?;
-    println!("✓ Claude Code skill installed ({}).", skill.display());
-    Ok(())
 }
 
 fn status(db: &Path) -> Result<()> {
