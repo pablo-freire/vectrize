@@ -71,3 +71,23 @@ fn add_rejects_a_file() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("is not a folder"));
     assert!(!vectrize(&db, &["status"]).contains("note.md"));
 }
+
+/// The request carries the vectrize version, so a daemon left running from another release answers STALE and exits.
+#[test]
+fn search_sends_the_vectrize_version() {
+    let tmp = Scratch(std::env::temp_dir().join(format!("vectrize-version-{}", std::process::id())));
+    std::fs::create_dir_all(&tmp.0).unwrap();
+    let db = tmp.0.join("i.db");
+    let daemon = std::os::unix::net::UnixListener::bind(db.with_extension("sock")).unwrap();
+    let fake = std::thread::spawn(move || {
+        use std::io::{BufRead, Write};
+        let (mut stream, _) = daemon.accept().unwrap();
+        let mut request = String::new();
+        std::io::BufReader::new(&stream).read_line(&mut request).unwrap();
+        stream.write_all(b"ERR fake daemon").unwrap();
+        request
+    });
+    let out = Command::new(env!("CARGO_BIN_EXE_vectrize")).arg("--db").arg(&db).args(["search", "x"]).output().unwrap();
+    assert!(String::from_utf8_lossy(&out.stderr).contains("fake daemon"));
+    assert!(fake.join().unwrap().starts_with(&format!("{}/", env!("CARGO_PKG_VERSION"))));
+}
