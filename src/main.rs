@@ -319,6 +319,7 @@ fn sync(db: &Path, add: Option<&Path>, models: &mut Models) -> Result<()> {
     let mut roots = roots(&conn);
     if let Some(dir) = add {
         let dir = dir.canonicalize().with_context(|| format!("{} does not exist", dir.display()))?;
+        anyhow::ensure!(dir.is_dir(), "{} is not a folder; add the folder that contains it", dir.display());
         if !roots.iter().any(|(_, r)| *r == dir) {
             roots.push((roots.iter().map(|r| r.0).max().unwrap_or(0) + 1, dir));
         }
