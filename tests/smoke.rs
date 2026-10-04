@@ -59,3 +59,15 @@ fn add_search_edit_remove() {
 
     assert!(vectrize(&db, &["remove", kb_arg]).contains("removed"));
 }
+
+#[test]
+fn add_rejects_a_file() {
+    let tmp = Scratch(std::env::temp_dir().join(format!("vectrize-file-{}", std::process::id())));
+    std::fs::create_dir_all(&tmp.0).unwrap();
+    let (db, note) = (tmp.0.join("i.db"), tmp.0.join("note.md"));
+    std::fs::write(&note, "# Note\n").unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_vectrize")).arg("--db").arg(&db).arg("add").arg(&note).output().unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("is not a folder"));
+    assert!(!vectrize(&db, &["status"]).contains("note.md"));
+}
