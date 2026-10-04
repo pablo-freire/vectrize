@@ -16,8 +16,8 @@ Everything runs on your machine, on any laptop CPU: no GPU, no API keys.
 curl -LsSf https://github.com/pablofrr/vectrize/releases/latest/download/vectrize-installer.sh | sh
 # or
 brew install pablofrr/tap/vectrize
-# or, from source (Rust 1.89+)
-cargo install --git https://github.com/pablofrr/vectrize
+# or, from crates.io (Rust 1.89+)
+cargo install vectrize
 ```
 
 macOS (Apple Silicon) and Linux (x86_64, arm64) with glibc 2.39+: Ubuntu 24.04, Debian 13, Fedora 40 or newer.
