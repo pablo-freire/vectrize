@@ -41,8 +41,8 @@ const CANDIDATES: i64 = 50;
 const DEBOUNCE: Duration = Duration::from_millis(300);
 const IDLE_CHECK: Duration = Duration::from_secs(10);
 /// Version of the daemon protocol: one line (`STATUS`, `STOP` or `<version> <JSON query>`) → the response, or
-/// `ERR message`. A daemon from another version (of the protocol or the schema) answers `ERR STALE` and exits, so
-/// after an upgrade the next search starts a new one.
+/// A daemon from another version (of vectrize, the protocol or the schema) answers ERR STALE and
+/// exits, so after an upgrade the next search starts a new one.
 const PROTOCOL: u32 = 1;
 
 #[derive(Parser)]
@@ -705,7 +705,7 @@ fn watch(db: &Path, unload_after_min: f64) -> Result<()> {
 }
 
 fn version() -> String {
-    format!("{PROTOCOL}.{SCHEMA}")
+    format!("{}/{PROTOCOL}.{SCHEMA}", env!("CARGO_PKG_VERSION"))
 }
 
 fn ask_daemon(db: &Path, request: &str) -> Result<String> {
