@@ -13,7 +13,7 @@ Everything runs on your machine, on any laptop CPU: no GPU, no API keys.
 ## Install
 
 ```sh
-curl -LsSf https://github.com/pablofrr/vectrize/releases/latest/download/vectrize-installer.sh | sh
+curl -LsSf https://vectrize.com/install | sh
 # or
 brew install pablofrr/tap/vectrize
 # or, from crates.io (Rust 1.89+)
