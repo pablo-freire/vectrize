@@ -18,3 +18,4 @@ Returns a JSON list, most relevant first: `file` (absolute path), `line`, `headi
 - It ALWAYS returns k results, whether they are relevant or not. Judge relevance yourself. If nothing fits after two reformulated searches, the documents probably don't cover it: say so instead of guessing (then fall back to Grep if useful).
 - If it reports that the index is being built, wait ~30 s and retry.
 - Cite sources as `file:line`.
+- If `vectrize` is not installed (command not found), follow [INSTALL.md](INSTALL.md).
