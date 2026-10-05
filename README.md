@@ -1,4 +1,16 @@
-# vectrize
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
+    <img alt="vectrize" src="assets/logo-light.svg" width="360">
+  </picture>
+</p>
+
+<p align="center">
+  <a href="https://crates.io/crates/vectrize"><img alt="crates.io" src="https://img.shields.io/crates/v/vectrize.svg"></a>
+  <a href="https://github.com/pablofrr/vectrize/releases/latest"><img alt="release" src="https://img.shields.io/github/v/release/pablofrr/vectrize"></a>
+  <img alt="license" src="https://img.shields.io/crates/l/vectrize.svg">
+  <a href="https://vectrize.com"><img alt="website" src="https://img.shields.io/badge/web-vectrize.com-ff7f00"></a>
+</p>
 
 Local semantic search over folders of Markdown documents, built for you and your AI agents.
 Everything runs on your machine, on any laptop CPU: no GPU, no API keys.
