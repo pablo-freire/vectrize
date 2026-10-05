@@ -7,7 +7,7 @@ description = "Local and fast semantic search over folders of Markdown documents
 keywords = ["search", "semantic", "markdown", "embeddings", "cli"]
 categories = ["command-line-utilities", "text-processing"]
 repository = "https://github.com/pablofrr/vectrize"
-homepage = "https://github.com/pablofrr/vectrize"
+homepage = "https://vectrize.com"
 license = "MIT OR Apache-2.0"
 include = ["src/**", "tests/**", "README.md", "LICENSE-*"]
 
